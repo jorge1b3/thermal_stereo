@@ -1,0 +1,57 @@
+raw
+├── frick_1
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── frick_2_test
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── frick_2_train
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── frick_2_val
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_1_1_test
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_1_1_train
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_1_2_test
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_1_2_train
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_2_1
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_3_test
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_3_train
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_4_test
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+├── hawkins_4_train
+│   ├── depth_filtered
+│   ├── img_left
+│   └── img_right
+└── hawkins_4_val
+    ├── depth_filtered
+    ├── img_left
+    └── img_right
