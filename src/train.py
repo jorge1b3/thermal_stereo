@@ -207,7 +207,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         self.best_model = None
         self.best_optimizer = None
         self.best_epoch = -1
