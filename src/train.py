@@ -21,6 +21,7 @@ import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -523,7 +524,8 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
     Función de entrenamiento para el modelo unificado.
     """
     # Configuración de pesos para las diferentes escalas
-    scale_weights = [0.5, 0.7, 0.85, 1.0]  # para 4 escalas
+    # El modelo puede devolver más de 4 escalas debido al mapa mejorado, así que hacemos la lista más larga
+    scale_weights = [0.5, 0.7, 0.85, 1.0, 1.0, 1.0]  # Extendemos para soportar hasta 6 escalas
 
     # Crear directorio para guardar modelos si no existe
     os.makedirs(args.output_dir, exist_ok=True)
@@ -577,15 +579,33 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
             loss = 0.0
 
             # Para cada escala, calcular la pérdida
-            for i, (mono_depth, stereo_depth) in enumerate(
-                zip(
-                    output["multi_scale_mono_depth"], output["multi_scale_stereo_depth"]
-                )
-            ):
+            mono_depths = output["multi_scale_mono_depth"]
+            stereo_depths = output["multi_scale_stereo_depth"]
+            
+            # Asegurar que sólo utilizamos tantas escalas como tengamos pesos definidos
+            num_scales = min(len(mono_depths), len(stereo_depths), len(scale_weights))
+            
+            for i in range(num_scales):
+                mono_depth = mono_depths[i]
+                stereo_depth = stereo_depths[i]
+                
+                # Verificar y ajustar tamaños si son diferentes
+                if mono_depth.shape[2:] != depth.shape[2:]:
+                    # Redimensionar los mapas de profundidad predichos para que coincidan con el ground truth
+                    mono_depth_resized = F.interpolate(
+                        mono_depth, size=depth.shape[2:], mode='bilinear', align_corners=True
+                    )
+                    stereo_depth_resized = F.interpolate(
+                        stereo_depth, size=depth.shape[2:], mode='bilinear', align_corners=True
+                    )
+                else:
+                    mono_depth_resized = mono_depth
+                    stereo_depth_resized = stereo_depth
+                
                 # Aplicar peso a la escala correspondiente
                 scale_loss = (
-                    smooth_l1_loss(mono_depth, depth)
-                    + smooth_l1_loss(stereo_depth, depth)
+                    smooth_l1_loss(mono_depth_resized, depth)
+                    + smooth_l1_loss(stereo_depth_resized, depth)
                 ) * scale_weights[i]
 
                 loss += scale_loss

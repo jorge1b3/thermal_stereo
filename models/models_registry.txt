@@ -1,2 +1,4 @@
 20250531_150942 | unified_depth_model_unified_lr_1.000e-04_bs_2_ep_2_frac_0.0 | Época: 1 | Val Loss: 0.0012
 20250531_154149 | unified_depth_model_unified_lr_1.000e-04_bs_4_ep_20_frac_0.2 | Época: 14 | Val Loss: 0.0009
+20250531_160602 | unified_depth_model_unified_lr_1.000e-04_bs_4_ep_5_frac_0.2 | Época: 4 | Val Loss: 0.0011
+20250531_170729 | unified_depth_model_unified_lr_1.000e-04_bs_1_ep_5_frac_0.1 | Época: 0 | Val Loss: 0.0153

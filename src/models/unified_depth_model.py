@@ -310,8 +310,12 @@ class SwinTransformerEncoder(nn.Module):
         super(SwinTransformerEncoder, self).__init__()
 
         # Capa inicial de convolución con GroupNorm en lugar de BatchNorm2d
+        # Reducción del stride de 4 a 2 para mantener mayor resolución
         self.patch_embed = nn.Sequential(
-            nn.Conv2d(in_channels, base_filters, kernel_size=4, stride=4, padding=0),
+            nn.Conv2d(in_channels, base_filters, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(min(8, base_filters), base_filters),
+            nn.GELU(),
+            nn.Conv2d(base_filters, base_filters, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(min(8, base_filters), base_filters),
             nn.GELU(),
         )
@@ -429,7 +433,7 @@ class PyramidPoolingModule(nn.Module):
 
         # Asegurarse de que haya al menos una salida
         if not outputs:
-            print(f"Advertencia: No hay ramas PPM exitosas, devolviendo entrada original")
+            print("Advertencia: No hay ramas PPM exitosas, devolviendo entrada original")
             return x
 
         # Agregar la entrada original a las salidas
@@ -538,6 +542,18 @@ class UnifiedDepthModel(nn.Module):
         self.encoder = SwinTransformerEncoder(
             in_channels, base_filters=base_filters // 2
         )
+        
+        # Añadir módulo de super-resolución para mejorar detalles en el mapa de profundidad
+        # Usamos el número de canales de la primera escala
+        self.super_resolution = EdgeAwareSuperResolutionModule(
+            in_channels=base_filters // 2,  # base_filters // 2 corresponde a num_features[0]
+            scale_factor=2  # Factor de escala para la resolución final
+        )
+        
+        # Red de refinamiento para reducir el efecto de "parches" y mejorar detalles finos
+        self.refinement_network = DepthRefinementNetwork(
+            in_channels=base_filters // 2  # base_filters // 2 corresponde a num_features[0]
+        )
 
         # Pyramid Pooling Module para contexto global
         num_features = [
@@ -605,6 +621,10 @@ class UnifiedDepthModel(nn.Module):
             ]
         )
 
+        # No necesitamos inicializar self.sr_module ya que usamos self.super_resolution
+
+        # No necesitamos inicializar self.refinement_net ya que usamos self.refinement_network definido anteriormente
+
     def forward(self, left, right=None):
         """
         Args:
@@ -663,13 +683,241 @@ class UnifiedDepthModel(nn.Module):
             disp_preds.append(disp_full_res)
             prob_volumes.append(prob)
 
+        # Eliminamos el uso redundante del módulo sr_module ya que usaremos self.super_resolution más adelante
+
+        # Aplicar módulo de super-resolución para mejorar la calidad del mapa de profundidad
+        # Usamos las características de la primera escala (más detallada) con el primer mapa de profundidad
+        enhanced_depth = self.super_resolution(left_features[0], disp_preds[0])
+        
+        # Verificar y ajustar las dimensiones si es necesario antes de refinar
+        if left_features[0].shape[2:] != disp_preds[0].shape[2:]:
+            print(f"Ajustando dimensiones: left_features[0] {left_features[0].shape}, disp_preds[0] {disp_preds[0].shape}")
+            # Redimensionar el mapa de profundidad para que coincida con las características
+            disp_preds_resized = F.interpolate(
+                disp_preds[0], 
+                size=left_features[0].shape[2:],
+                mode='bilinear',
+                align_corners=True
+            )
+        else:
+            disp_preds_resized = disp_preds[0]
+            
+        # Refinar el mapa de profundidad combinando múltiples resoluciones
+        refined_depth = self.refinement_network(left_features[0], disp_preds_resized)
+        
+        # Asegurarnos de que todos los mapas de profundidad tengan el tamaño original de la entrada
+        original_size = left.shape[2:]
+        
+        # Redimensionar los mapas de profundidad finales para que coincidan con la entrada original
+        if refined_depth.shape[2:] != original_size:
+            print(f"Redimensionando la salida final para que coincida con el tamaño de entrada: {original_size}")
+            refined_depth = F.interpolate(refined_depth, size=original_size, mode='bilinear', align_corners=True)
+            enhanced_depth = F.interpolate(enhanced_depth, size=original_size, mode='bilinear', align_corners=True)
+        
+        # La resolución mejorada será ahora nuestra predicción principal
         return {
-            "mono_depth": disp_preds[0],  # Predicción en escala 1/4 (la más detallada)
-            "stereo_depth": disp_preds[0],
-            "multi_scale_mono_depth": disp_preds,
-            "multi_scale_stereo_depth": disp_preds,
+            "mono_depth": refined_depth,  # Predicción mejorada con super-resolución
+            "stereo_depth": refined_depth,
+            "multi_scale_mono_depth": [enhanced_depth] + disp_preds,  # Incluimos todas las escalas
+            "multi_scale_stereo_depth": [enhanced_depth] + disp_preds,
             "prob_volumes": prob_volumes,
         }
+
+
+class EdgeAwareSuperResolutionModule(nn.Module):
+    """
+    Módulo de súper-resolución con preservación de bordes para mapas de profundidad.
+    Este módulo mejora la resolución del mapa de profundidad mientras preserva los bordes y detalles finos.
+    """
+
+    def __init__(self, in_channels, scale_factor=2):
+        super(EdgeAwareSuperResolutionModule, self).__init__()
+        self.scale_factor = scale_factor
+        
+        # Detector de bordes utilizando convoluciones
+        self.edge_detector = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, in_channels), in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+        )
+        
+        # Red principal de super-resolución
+        self.up_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels*4, kernel_size=3, padding=1),
+            nn.GroupNorm(min(16, in_channels*4), in_channels*4),
+            nn.ReLU(inplace=True),
+            nn.PixelShuffle(2)  # Aumenta la resolución espacial x2
+        )
+        
+        if scale_factor == 4:
+            self.up_conv2 = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels*4, kernel_size=3, padding=1),
+                nn.GroupNorm(min(16, in_channels*4), in_channels*4),
+                nn.ReLU(inplace=True),
+                nn.PixelShuffle(2)  # Aumenta la resolución espacial x2 adicional
+            )
+        else:
+            self.up_conv2 = None
+        
+        # Capa de refinamiento final
+        self.refine = nn.Sequential(
+            nn.Conv2d(in_channels + 1, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, in_channels), in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, in_channels), in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1)
+        )
+
+    def forward(self, x, depth_map):
+        """
+        Args:
+            x: Características extraídas del encoder [B, C, H, W]
+            depth_map: Mapa de profundidad a mejorar [B, 1, H, W]
+        """
+        # Detectar bordes para preservar detalles
+        # Detectar bordes y añadirlos a las características
+        edge_features = self.edge_detector(x)
+        x = x + edge_features  # Conexión residual para preservar bordes
+        
+        # Primer nivel de super-resolución
+        up_features = self.up_conv1(x)
+        
+        # Segundo nivel si es necesario (para escala x4)
+        if self.up_conv2 is not None and self.scale_factor == 4:
+            up_features = self.up_conv2(up_features)
+        
+        # Aumentar resolución del mapa de profundidad para que coincida con las características
+        # Verificar que up_features tiene dimensiones válidas antes de hacer interpolación
+        if up_features.shape[2] > 0 and up_features.shape[3] > 0:
+            up_depth = F.interpolate(
+                depth_map, 
+                size=up_features.shape[2:], 
+                mode='bilinear', 
+                align_corners=True
+            )
+        else:
+            # En caso de dimensiones inválidas, simplemente usar el mapa original
+            print(f"Advertencia: Dimensiones inválidas en up_features {up_features.shape}, omitiendo interpolación")
+            up_depth = depth_map
+        
+        # Concatenar la profundidad inicial con características para el refinamiento
+        concat_features = torch.cat([up_features, up_depth], dim=1)
+        
+        # Refinar el mapa de profundidad final
+        refined_depth = self.refine(concat_features)
+        
+        return refined_depth + up_depth  # Conexión residual
+
+
+class DepthRefinementNetwork(nn.Module):
+    """
+    Red de refinamiento de mapas de profundidad que combina múltiples resoluciones para
+    mejorar la calidad final y reducir el efecto de "parches" de los Vision Transformers.
+    """
+    def __init__(self, in_channels):
+        super(DepthRefinementNetwork, self).__init__()
+        
+        # Detector de bordes para preservar contornos importantes
+        # Asegurarnos de que el número de grupos en GroupNorm sea consistente con el número de canales
+        num_groups = min(4, in_channels)
+        self.edge_detection = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1)
+        )
+        
+        # Capa de fusión para combinar el mapa de profundidad y las características de bordes
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels + 17, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Capa final para la predicción refinada
+        self.predict = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.GroupNorm(4, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1)
+        )
+        
+        # Módulo de atención espacial para enfocarse en áreas importantes
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=7, padding=3),
+            nn.GroupNorm(4, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, features, depth_map):
+        """
+        Args:
+            features: Características del encoder [B, C, H, W]
+            depth_map: Mapa de profundidad inicial [B, 1, H, W]
+        """
+        # Aplicar detección de bordes a las características
+        edge_map = self.edge_detection(features)
+        
+        # Aplicar mecanismo de atención espacial
+        # Primero calculamos estadísticas espaciales
+        avg_out = torch.mean(features, dim=1, keepdim=True)
+        max_out, _ = torch.max(features, dim=1, keepdim=True)
+        spatial_features = torch.cat([avg_out, max_out], dim=1)
+        attention_weights = self.spatial_attention(spatial_features)
+        
+        # Aplicar atención a las características
+        features_attended = features * attention_weights
+        
+        # Asegurar que todas las entradas tienen las mismas dimensiones espaciales
+        # Redimensionar depth_map para que coincida con features_attended
+        depth_resized = F.interpolate(
+            depth_map, 
+            size=(features_attended.shape[2], features_attended.shape[3]), 
+            mode='bilinear', 
+            align_corners=True
+        )
+        
+        # Verificar que edge_map tenga las mismas dimensiones espaciales que features_attended
+        if edge_map.shape[2:] != features_attended.shape[2:]:
+            print(f"Redimensionando edge_map {edge_map.shape} para que coincida con features_attended {features_attended.shape}")
+            edge_map = F.interpolate(
+                edge_map, 
+                size=(features_attended.shape[2], features_attended.shape[3]), 
+                mode='bilinear', 
+                align_corners=True
+            )
+        
+        # Concatenar mapa de profundidad redimensionado, características con atención y mapa de bordes
+        combined = torch.cat([features_attended, depth_resized, edge_map], dim=1)
+        
+        # Procesar con capas de fusión
+        refined_features = self.fusion(combined)
+        
+        # Predicción final
+        residual = self.predict(refined_features)
+        
+        # Asegurarnos de que residual y depth_map tengan el mismo tamaño antes de sumarlos
+        if residual.shape != depth_map.shape:
+            print(f"Redimensionando residual {residual.shape} para que coincida con depth_map {depth_map.shape}")
+            residual = F.interpolate(
+                residual,
+                size=depth_map.shape[2:],
+                mode='bilinear',
+                align_corners=True
+            )
+        
+        # Sumar al mapa de profundidad original (conexión residual)
+        refined_depth = depth_map + residual
+        
+        return refined_depth
 
 
 def prepare_inputs(batch, device):
@@ -753,9 +1001,21 @@ def smooth_l1_loss(pred, target, mask=None):
         target: valor objetivo (ground truth)
         mask: máscara opcional para aplicar en áreas válidas
     """
+    # Asegurarse de que pred y target tengan las mismas dimensiones espaciales
+    if pred.shape[2:] != target.shape[2:]:
+        print(f"Redimensionando tensores para el cálculo de pérdida: pred {pred.shape}, target {target.shape}")
+        # Siempre redimensionar la predicción para que coincida con el objetivo (ground truth)
+        # Esto es más apropiado ya que el ground truth representa la escala real que queremos alcanzar
+        pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=True)
+        
+        print(f"Nuevas dimensiones: pred {pred.shape}, target {target.shape}")
+    
     loss = F.smooth_l1_loss(pred, target, reduction="none")
 
     if mask is not None:
+        # Asegurarse de que la máscara también tenga el mismo tamaño
+        if mask.shape[2:] != loss.shape[2:]:
+            mask = F.interpolate(mask.float(), size=loss.shape[2:], mode='nearest').bool()
         loss = loss * mask
         return loss.sum() / (mask.sum() + 1e-7)
     else:

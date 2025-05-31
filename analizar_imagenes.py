@@ -58,7 +58,7 @@ def analizar_imagen(ruta_imagen):
 def main():
     """Función principal que analiza imágenes en diferentes carpetas."""
     # Directorio base
-    base_dir = "/home/ubuntu/thermal_stereo/raw/frick_2_test"
+    base_dir = "./raw/frick_2_test"
 
     # Nombre de imagen para analizar (asegúrate que existe en las tres carpetas)
     nombre_imagen = "00467.png"
