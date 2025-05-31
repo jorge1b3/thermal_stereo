@@ -27,25 +27,7 @@ def get_args():
     return parser.parse_args()
 
 
-def prepare_inputs(batch, device):
-    """
-    Prepara los datos de entrada para el modelo, transfiriéndolos al dispositivo correcto.
-    
-    Args:
-        batch: Lote de datos que contiene imágenes izquierda, derecha y mapa de profundidad
-        device: Dispositivo donde se ejecutará el modelo (CPU o GPU)
-        
-    Returns:
-        Tupla con las imágenes izquierda, derecha y el mapa de profundidad en el dispositivo correcto
-    """
-    left_images = batch['left_image'].to(device)
-    right_images = batch['right_image'].to(device)
-    depth_maps = batch['depth_map'].to(device)
-    
-    return left_images, right_images, depth_maps
-
-
-# Esta función ya se ha movido al archivo de modelos
+# Estas funciones ya se han movido al archivo de modelos
 
 
 if __name__ == "__main__":
