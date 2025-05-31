@@ -194,7 +194,7 @@ def parse_args():
 class EarlyStopping:
     """
     Clase para realizar early stopping durante el entrenamiento.
-    Detiene el entrenamiento cuando la mejora relativa de la métrica de validación 
+    Detiene el entrenamiento cuando la mejora relativa de la métrica de validación
     es menor que un umbral durante 'patience' épocas.
     Al final, carga el mejor modelo guardado.
     """
