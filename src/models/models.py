@@ -287,6 +287,11 @@ def prepare_inputs(batch, device):
     
     depth = depth.unsqueeze(1) if len(depth.shape) == 3 else depth
     
+    # Convertir a float32 antes de cualquier operación
+    left = left.float()
+    right = right.float()
+    depth = depth.float()
+    
     # Normalizar si es necesario (0-255 -> 0-1)
     left = left / 255.0 if left.max() > 1.0 else left
     right = right / 255.0 if right.max() > 1.0 else right
