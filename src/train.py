@@ -15,9 +15,9 @@ Uso:
 """
 
 import os
-import time
 import logging
 import argparse
+import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import numpy as np
+import matplotlib.pyplot as plt
 import wandb
 from tqdm import tqdm
 
@@ -153,8 +154,8 @@ def parse_args():
     parser.add_argument(
         "--min_delta",
         type=float,
-        default=0.001,
-        help="Cambio mínimo en la pérdida para considerarla como mejora",
+        default=0.01,
+        help="Mejora relativa mínima para continuar el entrenamiento (porcentaje, ej: 0.01 = 1%)",
     )
 
     # Parámetros para scheduler
@@ -193,44 +194,75 @@ def parse_args():
 class EarlyStopping:
     """
     Clase para realizar early stopping durante el entrenamiento.
-    Detiene el entrenamiento cuando la métrica de validación no mejora durante 'patience' épocas.
+    Detiene el entrenamiento cuando la mejora relativa de la métrica de validación 
+    es menor que un umbral durante 'patience' épocas.
+    Al final, carga el mejor modelo guardado.
     """
 
-    def __init__(self, patience=5, min_delta=0, path="checkpoint.pt", verbose=True):
+    def __init__(self, patience=5, min_delta=0.01, path="checkpoint.pt", verbose=True):
         self.patience = patience
-        self.min_delta = min_delta
+        self.min_delta = min_delta  # Ahora representa un porcentaje relativo (ej: 0.01 = 1%)
         self.path = path
         self.verbose = verbose
         self.counter = 0
         self.best_score = None
         self.early_stop = False
         self.val_loss_min = np.Inf
-
+        self.best_model = None
+        self.best_optimizer = None
+        self.best_epoch = -1
+    
     def __call__(self, val_loss, model, optimizer, epoch):
         score = -val_loss
-
+        
         if self.best_score is None:
+            # Primera evaluación
             self.best_score = score
             self.save_checkpoint(val_loss, model, optimizer, epoch)
-        elif score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.verbose:
-                logging.info(
-                    f"EarlyStopping counter: {self.counter} de {self.patience}"
-                )
-            if self.counter >= self.patience:
-                self.early_stop = True
         else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, optimizer, epoch)
-            self.counter = 0
-
+            # Calcular mejora relativa: (nuevo - antiguo) / abs(antiguo)
+            # Para score (negativo de val_loss), mejora si es mayor
+            if self.best_score != 0:
+                relative_improvement = (score - self.best_score) / abs(self.best_score)
+            else:
+                # Si el mejor score es 0, usamos mejora absoluta
+                relative_improvement = score - self.best_score
+            
+            if relative_improvement < self.min_delta:
+                # No hay mejora significativa
+                self.counter += 1
+                if self.verbose:
+                    logging.info(
+                        f"EarlyStopping counter: {self.counter} de {self.patience} "
+                        f"(mejora relativa: {relative_improvement:.2%}, umbral: {self.min_delta:.2%})"
+                    )
+                if self.counter >= self.patience:
+                    self.early_stop = True
+                    # Cargar el mejor modelo guardado
+                    self.load_best_model(model, optimizer)
+            else:
+                # Hay mejora significativa, resetear contador
+                self.best_score = score
+                self.save_checkpoint(val_loss, model, optimizer, epoch)
+                self.counter = 0
+                if self.verbose:
+                    logging.info(
+                        f"Mejora relativa significativa: {relative_improvement:.2%} > {self.min_delta:.2%}"
+                    )
+    
     def save_checkpoint(self, val_loss, model, optimizer, epoch):
         """Guardar modelo cuando hay mejora en la pérdida de validación"""
         if self.verbose:
             logging.info(
                 f"Pérdida de validación disminuida ({self.val_loss_min:.6f} --> {val_loss:.6f}). Guardando modelo..."
             )
+        
+        # Guardar estado para recuperación posterior
+        self.best_model = {key: val.cpu().clone() for key, val in model.state_dict().items()}
+        self.best_optimizer = optimizer.state_dict()
+        self.best_epoch = epoch
+        
+        # Guardar en disco
         torch.save(
             {
                 "epoch": epoch,
@@ -241,6 +273,18 @@ class EarlyStopping:
             self.path,
         )
         self.val_loss_min = val_loss
+    
+    def load_best_model(self, model, optimizer):
+        """Cargar el mejor modelo guardado"""
+        if self.best_model is not None and self.best_epoch >= 0:
+            if self.verbose:
+                logging.info(
+                    f"Cargando el mejor modelo de la época {self.best_epoch} "
+                    f"con pérdida de validación: {self.val_loss_min:.6f}"
+                )
+            # Cargar el mejor modelo
+            model.load_state_dict(self.best_model)
+            optimizer.load_state_dict(self.best_optimizer)
 
 
 def train_traditional(
@@ -369,7 +413,7 @@ def train_traditional(
             logging.info("Early stopping activado")
             break
 
-        # Guardar checkpoint cada 5 épocas
+        # Guardar checkpoint cada 5 épocas (solo guardar localmente)
         if (epoch + 1) % 5 == 0:
             checkpoint_path = os.path.join(
                 args.output_dir, f"{experiment_name}_epoch_{epoch+1}.pth"
@@ -380,15 +424,25 @@ def train_traditional(
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "train_loss": epoch_loss,
+                    "train_loss": epoch_loss,  # para train_traditional usamos epoch_loss
                     "val_loss": val_loss,
                 },
                 checkpoint_path,
             )
             logging.info(f"Checkpoint guardado en época {epoch+1}")
 
-    # Guardar el modelo final
-    final_model_path = os.path.join(args.output_dir, f"{experiment_name}_final.pth")
+    # Cargar el mejor modelo antes de guardar el final
+    if early_stopping.best_model is not None:
+        logging.info(f"Cargando el mejor modelo de la época {early_stopping.best_epoch}")
+        model.load_state_dict(early_stopping.best_model)
+        optimizer.load_state_dict(early_stopping.best_optimizer)
+        val_loss = early_stopping.val_loss_min
+    
+    # Generar timestamp único para el nombre del archivo
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Guardar el modelo final (que es el mejor según val_loss)
+    final_model_path = os.path.join(args.output_dir, f"{experiment_name}_final_{timestamp}.pth")
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -396,17 +450,26 @@ def train_traditional(
             "scheduler_state_dict": scheduler.state_dict(),
             "val_loss": val_loss,
             "val_mae": val_mae,
+            "best_epoch": early_stopping.best_epoch,
+            "timestamp": timestamp,
+            "config": vars(args),
         },
         final_model_path,
     )
-    logging.info(f"Modelo final guardado en {final_model_path}")
+    logging.info(f"Mejor modelo (época {early_stopping.best_epoch}) guardado como modelo final en {final_model_path}")
 
-    # También guardar una copia con el nombre estándar
+    # También guardar una copia con el nombre estándar (sobrescribe la anterior)
     standard_path = os.path.join(args.output_dir, "model_trained.pth")
     torch.save(model.state_dict(), standard_path)
     logging.info(f"Modelo estándar guardado en {standard_path}")
 
-    # Generar y guardar algunas predicciones de ejemplo
+    # Registrar la ruta del modelo guardado para referencia futura
+    models_registry_path = os.path.join(args.output_dir, "models_registry.txt")
+    with open(models_registry_path, "a") as f:
+        f.write(f"{timestamp} | {experiment_name} | Época: {early_stopping.best_epoch} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f}\n")
+    logging.info(f"Registro de modelo añadido a {models_registry_path}")
+
+    # Generar y guardar algunas predicciones de ejemplo con el mejor modelo
     model.eval()
     with torch.no_grad():
         batch = next(iter(val_loader))
@@ -419,6 +482,19 @@ def train_traditional(
         left_img = left[0].permute(1, 2, 0).cpu().numpy()
         right_img = right[0].permute(1, 2, 0).cpu().numpy()
 
+        # Crear figuras con colormap inferno para profundidad
+        fig_true, ax_true = plt.subplots()
+        img_true = ax_true.imshow(depth_true, cmap='inferno')
+        ax_true.set_title("Profundidad Real")
+        ax_true.axis('off')
+        fig_true.colorbar(img_true)
+        
+        fig_pred, ax_pred = plt.subplots()
+        img_pred = ax_pred.imshow(depth_pred, cmap='inferno')
+        ax_pred.set_title("Profundidad Predicha")
+        ax_pred.axis('off')
+        fig_pred.colorbar(img_pred)
+        
         # Registrar imágenes en wandb
         wandb.log(
             {
@@ -429,20 +505,17 @@ def train_traditional(
                     right_img, caption="Imagen Térmica Derecha"
                 ),
                 "sample_depth_true": wandb.Image(
-                    depth_true, caption="Profundidad Real"
+                    fig_true, caption="Profundidad Real"
                 ),
                 "sample_depth_pred": wandb.Image(
-                    depth_pred, caption="Profundidad Predicha"
+                    fig_pred, caption="Profundidad Predicha"
                 ),
             }
         )
-
-    # Subir los modelos como artifacts
-    artifact = wandb.Artifact("model_weights", type="model")
-    artifact.add_file(os.path.join(args.output_dir, f"{experiment_name}_best.pth"))
-    artifact.add_file(final_model_path)
-    artifact.add_file(standard_path)
-    wandb.log_artifact(artifact)
+        plt.close(fig_true)
+        plt.close(fig_pred)
+        
+    # No subimos los pesos a wandb, solo la configuración
 
 
 def train_unified(model, train_loader, val_loader, optimizer, scheduler, device, args):
@@ -583,7 +656,7 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
             logging.info("Early stopping activado")
             break
 
-        # Guardar checkpoint cada 5 épocas
+        # Guardar checkpoint cada 5 épocas (solo guardar localmente)
         if (epoch + 1) % 5 == 0:
             checkpoint_path = os.path.join(
                 args.output_dir, f"{experiment_name}_epoch_{epoch+1}.pth"
@@ -594,30 +667,49 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "train_loss": train_loss,
+                    "train_loss": train_loss,  # para train_unified usamos train_loss
                     "val_loss": val_loss,
                 },
                 checkpoint_path,
             )
             logging.info(f"Checkpoint guardado en época {epoch+1}")
 
-    # Guardar modelo final
-    final_model_path = os.path.join(args.output_dir, f"{experiment_name}_final.pth")
+    # Cargar el mejor modelo antes de guardar el final
+    if early_stopping.best_model is not None:
+        logging.info(f"Cargando el mejor modelo de la época {early_stopping.best_epoch}")
+        model.load_state_dict(early_stopping.best_model)
+        optimizer.load_state_dict(early_stopping.best_optimizer)
+        val_loss = early_stopping.val_loss_min
+    
+    # Generar timestamp único para el nombre del archivo
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Guardar modelo final (que es el mejor según val_loss)
+    final_model_path = os.path.join(args.output_dir, f"{experiment_name}_final_{timestamp}.pth")
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "val_loss": val_loss,
+            "best_epoch": early_stopping.best_epoch,
+            "timestamp": timestamp,
+            "config": vars(args),
         },
         final_model_path,
     )
-    logging.info(f"Modelo final guardado en {final_model_path}")
+    logging.info(f"Mejor modelo (época {early_stopping.best_epoch}) guardado como modelo final en {final_model_path}")
 
-    # También guardar una copia con el nombre estándar
+    # También guardar una copia con el nombre estándar (sobrescribe la anterior)
     standard_path = os.path.join(args.output_dir, "unified_model_trained.pth")
     torch.save(model.state_dict(), standard_path)
     logging.info(f"Modelo estándar guardado en {standard_path}")
+    
+    # Registrar la ruta del modelo guardado para referencia futura
+    models_registry_path = os.path.join(args.output_dir, "models_registry.txt")
+    with open(models_registry_path, "a") as f:
+        f.write(f"{timestamp} | {experiment_name} | Época: {early_stopping.best_epoch} | Val Loss: {val_loss:.4f}\n")
+    logging.info(f"Registro de modelo añadido a {models_registry_path}")
 
     # Crear una visualización de ejemplo
     model.eval()
@@ -633,6 +725,25 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
         left_img = left[0].permute(1, 2, 0).cpu().numpy()
         right_img = right[0].permute(1, 2, 0).cpu().numpy()
 
+        # Crear figuras con colormap inferno para profundidad
+        fig_true, ax_true = plt.subplots()
+        img_true = ax_true.imshow(depth_true, cmap='inferno')
+        ax_true.set_title("Profundidad Real")
+        ax_true.axis('off')
+        fig_true.colorbar(img_true)
+        
+        fig_stereo, ax_stereo = plt.subplots()
+        img_stereo = ax_stereo.imshow(stereo_pred, cmap='inferno')
+        ax_stereo.set_title("Profundidad Estéreo Predicha")
+        ax_stereo.axis('off')
+        fig_stereo.colorbar(img_stereo)
+        
+        fig_mono, ax_mono = plt.subplots()
+        img_mono = ax_mono.imshow(mono_pred, cmap='inferno')
+        ax_mono.set_title("Profundidad Mono Predicha")
+        ax_mono.axis('off')
+        fig_mono.colorbar(img_mono)
+
         # Registrar imágenes en wandb
         wandb.log(
             {
@@ -643,23 +754,21 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
                     right_img, caption="Imagen Térmica Derecha"
                 ),
                 "sample_depth_true": wandb.Image(
-                    depth_true, caption="Profundidad Real"
+                    fig_true, caption="Profundidad Real"
                 ),
                 "sample_stereo_pred": wandb.Image(
-                    stereo_pred, caption="Profundidad Estéreo Predicha"
+                    fig_stereo, caption="Profundidad Estéreo Predicha"
                 ),
                 "sample_mono_pred": wandb.Image(
-                    mono_pred, caption="Profundidad Mono Predicha"
+                    fig_mono, caption="Profundidad Mono Predicha"
                 ),
             }
         )
-
-    # Subir los modelos como artifacts
-    artifact = wandb.Artifact("model_weights", type="model")
-    artifact.add_file(os.path.join(args.output_dir, f"{experiment_name}_best.pth"))
-    artifact.add_file(final_model_path)
-    artifact.add_file(standard_path)
-    wandb.log_artifact(artifact)
+        plt.close(fig_true)
+        plt.close(fig_stereo)
+        plt.close(fig_mono)
+        
+    # No subimos los pesos a wandb, solo la configuración
 
 
 def main():
@@ -841,14 +950,18 @@ def main():
             args,
         )
 
-    # Guardar archivo de configuración
+    # Guardar archivo de configuración local
     os.makedirs("config", exist_ok=True)
-    config_path = os.path.join("config", f"{experiment_name}_config.txt")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    config_path = os.path.join("config", f"{experiment_name}_config_{timestamp}.txt")
     with open(config_path, "w") as f:
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Experimento: {experiment_name}\n")
+        f.write("-" * 50 + "\n")
         for k, v in vars(args).items():
             f.write(f"{k}: {v}\n")
 
-    # Subir el archivo de configuración como artefacto
+    # Subir solo el archivo de configuración como artefacto (no los pesos)
     artifact_config = wandb.Artifact("run_config", type="config")
     artifact_config.add_file(config_path)
     wandb.log_artifact(artifact_config)

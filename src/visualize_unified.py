@@ -12,7 +12,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from torch.utils.data import DataLoader
-import cv2
 
 from src.models.unified_depth_model import UnifiedDepthModel, prepare_inputs
 from src.data.dataset import ThermalDepthDataset

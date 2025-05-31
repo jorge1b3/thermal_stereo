@@ -3,7 +3,6 @@
 
 import os
 import argparse
-import torch
 from src.utils.data_loader import (
     load_train_dataset,
     load_test_dataset,

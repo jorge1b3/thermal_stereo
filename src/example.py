@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-import numpy as np
 import matplotlib.pyplot as plt
 from src.utils.data_loader import load_train_dataset, load_test_dataset
 
