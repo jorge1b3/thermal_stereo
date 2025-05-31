@@ -8,6 +8,7 @@ import logging
 import wandb
 from torch.utils.data import DataLoader
 from src.utils.data_loader import load_train_dataset, load_test_dataset
+from src.models.models import get_model, prepare_inputs
 
 
 def get_args():
@@ -24,6 +25,24 @@ def get_args():
     parser.add_argument("--num_workers", type=int, default=4, help="Número de workers para la carga de datos")
     parser.add_argument("--val_split", type=float, default=0.1, help="Fracción de datos para validación")
     return parser.parse_args()
+
+
+def prepare_inputs(batch, device):
+    """
+    Prepara los datos de entrada para el modelo, transfiriéndolos al dispositivo correcto.
+    
+    Args:
+        batch: Lote de datos que contiene imágenes izquierda, derecha y mapa de profundidad
+        device: Dispositivo donde se ejecutará el modelo (CPU o GPU)
+        
+    Returns:
+        Tupla con las imágenes izquierda, derecha y el mapa de profundidad en el dispositivo correcto
+    """
+    left_images = batch['left_image'].to(device)
+    right_images = batch['right_image'].to(device)
+    depth_maps = batch['depth_map'].to(device)
+    
+    return left_images, right_images, depth_maps
 
 
 # Esta función ya se ha movido al archivo de modelos
@@ -80,7 +99,7 @@ if __name__ == "__main__":
     ).to(device)
     
     logging.info(f"Creado modelo con {args.initial_filters} filtros iniciales y dropout {args.dropout_rate}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     criterion = torch.nn.L1Loss()  # MAE para regresión de profundidad
 
     best_val_loss = float('inf')
