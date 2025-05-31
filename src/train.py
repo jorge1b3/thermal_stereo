@@ -178,6 +178,14 @@ def parse_args():
         default=None,
         help="Ruta del checkpoint para reanudar el entrenamiento",
     )
+    
+    # Parámetro de fracción del dataset
+    parser.add_argument(
+        "--dataset_fraction",
+        type=float,
+        default=1.0,
+        help="Fracción del dataset a utilizar (0.0-1.0). Útil para pruebas rápidas.",
+    )
 
     return parser.parse_args()
 
@@ -245,7 +253,8 @@ def train_traditional(
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Nombre del experimento para wandb y guardado
-    experiment_name = f"{args.model_name}_{args.model_type}_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}"
+    fraction_suffix = f"_frac_{args.dataset_fraction:.1f}" if args.dataset_fraction < 1.0 else ""
+    experiment_name = f"{args.model_name}_{args.model_type}_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}{fraction_suffix}"
 
     # Configurar early stopping
     early_stopping = EarlyStopping(
@@ -447,7 +456,8 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Nombre del experimento para wandb y guardado
-    experiment_name = f"{args.model_name}_unified_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}"
+    fraction_suffix = f"_frac_{args.dataset_fraction:.1f}" if args.dataset_fraction < 1.0 else ""
+    experiment_name = f"{args.model_name}_unified_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}{fraction_suffix}"
 
     # Configurar early stopping
     early_stopping = EarlyStopping(
@@ -657,7 +667,8 @@ def main():
     args = parse_args()
 
     # Configuración de nombre para el experimento
-    experiment_name = f"{args.model_name}_{args.model_type}_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}"
+    fraction_suffix = f"_frac_{args.dataset_fraction:.1f}" if args.dataset_fraction < 1.0 else ""
+    experiment_name = f"{args.model_name}_{args.model_type}_lr_{args.lr:.3e}_bs_{args.batch_size}_ep_{args.num_epochs}{fraction_suffix}"
 
     # Configurar logging con archivo
     log_file = os.path.join("logs", f"{experiment_name}.log")
@@ -680,6 +691,14 @@ def main():
             root_dir=args.data_dir,
             transform=None,  # Las transformaciones se hacen en prepare_inputs
         )
+        
+        # Aplicar fracción del dataset si es menor que 1.0
+        if args.dataset_fraction < 1.0:
+            total_size = len(dataset)
+            subset_size = int(total_size * args.dataset_fraction)
+            indices = torch.randperm(total_size)[:subset_size]
+            dataset = torch.utils.data.Subset(dataset, indices)
+            logging.info(f"Usando una fracción del {args.dataset_fraction:.1%} del dataset ({subset_size} de {total_size} muestras)")
 
         # Dividir en conjunto de entrenamiento y validación
         val_size = int(len(dataset) * args.val_split)
@@ -719,19 +738,67 @@ def main():
 
     else:
         # === CARGA DE DATOS PARA MODELO TRADICIONAL ===
-        # Cargar los datasets de entrenamiento y validación
-        train_loader = load_train_dataset(
-            root_dir=args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
+        # Cargar los datasets de entrenamiento y validación con posible submuestreo
+        if args.dataset_fraction < 1.0:
+            # Cuando usamos una fracción del dataset, tenemos que crear los datasets primero
+            train_dataset = ThermalDepthDataset(
+                root_dir=args.data_dir,
+                split="train",
+                transform=None
+            )
+            test_dataset = ThermalDepthDataset(
+                root_dir=args.data_dir,
+                split="test",
+                transform=None
+            )
+            
+            # Aplicar la fracción a ambos datasets
+            total_train = len(train_dataset)
+            total_test = len(test_dataset)
+            train_size = int(total_train * args.dataset_fraction)
+            test_size = int(total_test * args.dataset_fraction)
+            
+            # Crear subsets aleatorios
+            train_indices = torch.randperm(total_train)[:train_size]
+            test_indices = torch.randperm(total_test)[:test_size]
+            
+            train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+            test_subset = torch.utils.data.Subset(test_dataset, test_indices)
+            
+            # Crear data loaders
+            train_loader = DataLoader(
+                train_subset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+            
+            val_loader = DataLoader(
+                test_subset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+            
+            logging.info(f"Usando fracción del {args.dataset_fraction:.1%} del dataset:")
+            logging.info(f"  - Entrenamiento: {train_size} de {total_train} muestras")
+            logging.info(f"  - Validación: {test_size} de {total_test} muestras")
+        else:
+            # Usar los loaders estándar sin modificación
+            train_loader = load_train_dataset(
+                root_dir=args.data_dir,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
 
-        # Usar conjunto específico de validación
-        val_loader = load_test_dataset(
-            root_dir=args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
+            # Usar conjunto específico de validación
+            val_loader = load_test_dataset(
+                root_dir=args.data_dir,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
 
         # Crear modelo tradicional
         model = get_model(
