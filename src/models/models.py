@@ -266,13 +266,25 @@ def prepare_inputs(batch, device):
     Prepara los datos de entrada para el modelo.
     """
     # Convertir imágenes a tensores y normalizar
-    left = torch.tensor(batch['left'], dtype=torch.float32).to(device)
-    right = torch.tensor(batch['right'], dtype=torch.float32).to(device)
-    depth = torch.tensor(batch['depth'], dtype=torch.float32).to(device)
+    left = batch['left'].to(device) if torch.is_tensor(batch['left']) else torch.tensor(batch['left'], dtype=torch.float32).to(device)
+    right = batch['right'].to(device) if torch.is_tensor(batch['right']) else torch.tensor(batch['right'], dtype=torch.float32).to(device)
+    depth = batch['depth'].to(device) if torch.is_tensor(batch['depth']) else torch.tensor(batch['depth'], dtype=torch.float32).to(device)
     
     # Reorganizar dimensiones para formato de imagen (B, C, H, W)
-    left = left.permute(0, 3, 1, 2) if len(left.shape) == 4 else left.unsqueeze(1)
-    right = right.permute(0, 3, 1, 2) if len(right.shape) == 4 else right.unsqueeze(1)
+    if len(left.shape) == 4 and left.shape[3] in [1, 3]:  # Si es [B, H, W, C]
+        left = left.permute(0, 3, 1, 2)
+    elif len(left.shape) == 3:  # Si es [B, H, W]
+        left = left.unsqueeze(1)
+        # Si el modelo espera 3 canales pero la imagen tiene 1, replicamos el canal
+        left = left.repeat(1, 3, 1, 1)
+    
+    if len(right.shape) == 4 and right.shape[3] in [1, 3]:  # Si es [B, H, W, C]
+        right = right.permute(0, 3, 1, 2)
+    elif len(right.shape) == 3:  # Si es [B, H, W]
+        right = right.unsqueeze(1)
+        # Si el modelo espera 3 canales pero la imagen tiene 1, replicamos el canal
+        right = right.repeat(1, 3, 1, 1)
+    
     depth = depth.unsqueeze(1) if len(depth.shape) == 3 else depth
     
     # Normalizar si es necesario (0-255 -> 0-1)
