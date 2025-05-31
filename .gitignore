@@ -181,4 +181,5 @@ raw
 *.png
 wandb
 *.pth
+config/
 

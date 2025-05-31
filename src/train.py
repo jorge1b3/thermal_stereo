@@ -148,13 +148,13 @@ def parse_args():
     parser.add_argument(
         "--patience",
         type=int,
-        default=5,
+        default=3,
         help="Número de épocas a esperar para early stopping",
     )
     parser.add_argument(
         "--min_delta",
         type=float,
-        default=0.01,
+        default=0.015,
         help="Mejora relativa mínima para continuar el entrenamiento (porcentaje, ej: 0.01 = 1%)",
     )
 

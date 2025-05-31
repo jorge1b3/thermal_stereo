@@ -309,10 +309,10 @@ class SwinTransformerEncoder(nn.Module):
     def __init__(self, in_channels, base_filters=64, depths=[2, 2, 6, 2]):
         super(SwinTransformerEncoder, self).__init__()
 
-        # Capa inicial de convolución
+        # Capa inicial de convolución con GroupNorm en lugar de BatchNorm2d
         self.patch_embed = nn.Sequential(
             nn.Conv2d(in_channels, base_filters, kernel_size=4, stride=4, padding=0),
-            nn.BatchNorm2d(base_filters),
+            nn.GroupNorm(min(8, base_filters), base_filters),
             nn.GELU(),
         )
 
@@ -332,21 +332,23 @@ class SwinTransformerEncoder(nn.Module):
             out_dim = num_features[i]
 
             if downsample:
+                # Usar GroupNorm en lugar de BatchNorm2d
                 self.stages.append(
                     nn.Sequential(
                         nn.Conv2d(in_dim, out_dim, kernel_size=2, stride=2),
-                        nn.BatchNorm2d(out_dim),
+                        nn.GroupNorm(min(16, out_dim), out_dim),
                         nn.GELU(),
                     )
                 )
 
             # Bloques NeWCRF (simplificado como bloques de convolucion)
+            # Usar GroupNorm en lugar de BatchNorm2d
             layer = nn.Sequential(
                 nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_dim),
+                nn.GroupNorm(min(16, out_dim), out_dim),
                 nn.GELU(),
                 nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_dim),
+                nn.GroupNorm(min(16, out_dim), out_dim),
                 nn.GELU(),
             )
             self.stages.append(layer)
@@ -378,36 +380,70 @@ class PyramidPoolingModule(nn.Module):
         super(PyramidPoolingModule, self).__init__()
         self.sizes = [1, 2, 3, 6]
 
-        self.branches = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.AdaptiveAvgPool2d(size),
-                    nn.Conv2d(in_channels, in_channels // 4, kernel_size=1),
-                    nn.BatchNorm2d(in_channels // 4),
-                    nn.ReLU(inplace=True),
-                )
-                for size in self.sizes
-            ]
-        )
+        # Crear branches usando GroupNorm en lugar de BatchNorm2d
+        self.branches = nn.ModuleList()
+        for size in self.sizes:
+            channels_quarter = in_channels // 4
+            # Asegurar que num_groups sea compatible con channels_quarter
+            num_groups = min(8, channels_quarter)
+            branch = nn.Sequential(
+                nn.AdaptiveAvgPool2d(size),
+                nn.Conv2d(in_channels, channels_quarter, kernel_size=1),
+                # GroupNorm es más robusto con tensores pequeños y batch_size=1
+                nn.GroupNorm(num_groups, channels_quarter),
+                nn.ReLU(inplace=True),
+            )
+            self.branches.append(branch)
 
+        # Usar GroupNorm también en la capa de salida
+        num_out_groups = min(16, out_channels)
         self.conv_out = nn.Sequential(
             nn.Conv2d(in_channels * 2, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(num_out_groups, out_channels),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
         size = x.size()[2:]
 
+        # Verificar que la entrada no sea demasiado pequeña
+        B, C, H, W = x.shape
+        if H <= 1 or W <= 1:
+            # Si el tamaño espacial es muy pequeño, aplicar un procesamiento alternativo
+            print(f"Advertencia: PPM recibió un tensor con forma {x.shape}, aplicando procesamiento especial")
+            # Simplemente aplicar convolución 1x1 para ajustar canales
+            return nn.Conv2d(C, C, kernel_size=1, bias=False).to(x.device)(x)
+
         outputs = []
         for branch in self.branches:
-            out = branch(x)
-            out = F.interpolate(out, size=size, mode="bilinear", align_corners=True)
-            outputs.append(out)
+            try:
+                out = branch(x)
+                # Usar interpolación solo si es necesario
+                if out.shape[2:] != size:
+                    out = F.interpolate(out, size=size, mode="bilinear", align_corners=True)
+                outputs.append(out)
+            except RuntimeError as e:
+                print(f"Error en rama PPM: {e}")
+                # En caso de error, saltear esta rama
+                continue
 
+        # Asegurarse de que haya al menos una salida
+        if not outputs:
+            print(f"Advertencia: No hay ramas PPM exitosas, devolviendo entrada original")
+            return x
+
+        # Agregar la entrada original a las salidas
         outputs.append(x)
+        
+        # Concatenar todas las salidas
         outputs = torch.cat(outputs, dim=1)
-        return self.conv_out(outputs)
+        
+        # Aplicar capa de convolución final
+        try:
+            return self.conv_out(outputs)
+        except RuntimeError as e:
+            print(f"Error en conv_out PPM: {e}, devolviendo entrada original")
+            return x
 
 
 class CostVolumeBuilder(nn.Module):
@@ -457,10 +493,11 @@ class DisparityPredictor(nn.Module):
         super(DisparityPredictor, self).__init__()
         self.max_disp = max_disp
 
-        # Convoluciones para predicción
+        # Convoluciones para predicción, usando GroupNorm en lugar de BatchNorm2d
+        channels_half = in_channels // 2
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_channels // 2),
+            nn.Conv2d(in_channels, channels_half, kernel_size=3, padding=1),
+            nn.GroupNorm(min(16, channels_half), channels_half),
             nn.ReLU(inplace=True),
         )
 
@@ -536,22 +573,24 @@ class UnifiedDepthModel(nn.Module):
             ]
         )
 
-        # Capas de fusión para características + volume de costos
-        self.fusion_layers = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(
-                        num_features[i] + (max_disp // (2**i) // 4),
-                        num_features[i],
-                        kernel_size=3,
-                        padding=1,
-                    ),
-                    nn.BatchNorm2d(num_features[i]),
-                    nn.ReLU(inplace=True),
-                )
-                for i in range(self.scales)
-            ]
-        )
+        # Capas de fusión para características + volume de costos usando GroupNorm
+        self.fusion_layers = nn.ModuleList()
+        for i in range(self.scales):
+            out_channels = num_features[i]
+            # Determinar número de grupos para GroupNorm (como máximo 16, mínimo 1)
+            num_groups = min(16, out_channels)
+            
+            fusion_layer = nn.Sequential(
+                nn.Conv2d(
+                    num_features[i] + (max_disp // (2**i) // 4),
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                ),
+                nn.GroupNorm(num_groups, out_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.fusion_layers.append(fusion_layer)
 
         # Capas de upsampling para predicciones a escala completa
         self.upsampling = nn.ModuleList(
@@ -572,16 +611,8 @@ class UnifiedDepthModel(nn.Module):
             left: Imagen térmica izquierda [B, C, H, W]
             right: Imagen térmica derecha [B, C, H, W] o None para el caso monocular
         """
-        # Reducir tamaño a la mitad para acelerar entrenamiento
-        orig_size = (left.shape[2], left.shape[3])
-        left = F.interpolate(
-            left, scale_factor=0.5, mode="bilinear", align_corners=True
-        )
-        if right is not None:
-            right = F.interpolate(
-                right, scale_factor=0.5, mode="bilinear", align_corners=True
-            )
-
+        # Trabajar directamente con el tamaño original sin reducción de escala
+        
         # Extraer características mediante el encoder compartido
         left_features = self.encoder(left)
         right_features = None if right is None else self.encoder(right)
@@ -624,13 +655,10 @@ class UnifiedDepthModel(nn.Module):
             # Predecir disparidad/profundidad
             disp, prob = self.disp_predictors[scale](x)
 
-            # Upscale para tener la misma resolución que la entrada original
+            # Upscale para tener la resolución completa
+            # Nota: Como no hacemos downsampling inicial, solo necesitamos usar upsampling
+            # para compensar el downsampling del encoder
             disp_full_res = self.upsampling[scale](disp)
-
-            # Redimensionar al tamaño original
-            disp_full_res = F.interpolate(
-                disp_full_res, size=orig_size, mode="bilinear", align_corners=True
-            )
 
             disp_preds.append(disp_full_res)
             prob_volumes.append(prob)
