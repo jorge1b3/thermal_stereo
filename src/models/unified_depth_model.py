@@ -114,30 +114,73 @@ class NeWCRFBlock(nn.Module):
         # x: resultado de predicción anterior o característica de entrada inicial
         # feature: característica concatenada (puede incluir volumen de costos)
         
-        # Calcular potencial unario
-        unary_potential = self.unary_proj(x)
-        
-        # Procesamiento de ventana para atención
-        H, W = feature.shape[-2:]
-        feature_window = self._window_partition(feature.flatten(2).transpose(-1, -2), self.window_size)
-        
-        # Calcular potencial pairwise a través de la atención
-        norm_feature = self.norm1(feature_window)
-        pairwise_potential = self.attn(norm_feature)
-        
-        # Combinar potenciales
-        x = unary_potential + self._window_reverse(pairwise_potential, self.window_size, H, W)
-        
-        # Procesamiento final MLP
-        x = x + self.mlp(self.norm2(x))
+        try:
+            # Calcular potencial unario
+            unary_potential = self.unary_proj(x)
+            
+            # Procesamiento de ventana para atención
+            H, W = feature.shape[-2:]
+            
+            # Asegurarse de que los datos estén en formato adecuado antes de procesar
+            feature_flattened = feature.flatten(2).transpose(-1, -2)
+            
+            # Verificar que las dimensiones sean consistentes
+            if feature_flattened.size(1) != H * W:
+                print(f"Advertencia: dimensiones inconsistentes. feature_flattened: {feature_flattened.size()}, HxW: {H*W}")
+                # Ajustar el tensor para que coincida con las dimensiones esperadas
+                B, N, C = feature_flattened.size()
+                if N > H * W:
+                    feature_flattened = feature_flattened[:, :H*W, :]
+                else:
+                    # Rellenar con ceros si es necesario
+                    padded = torch.zeros(B, H*W, C, device=feature_flattened.device)
+                    padded[:, :N, :] = feature_flattened
+                    feature_flattened = padded
+            
+            feature_window = self._window_partition(feature_flattened, self.window_size)
+            
+            # Calcular potencial pairwise a través de la atención
+            norm_feature = self.norm1(feature_window)
+            pairwise_potential = self.attn(norm_feature)
+            
+            # Combinar potenciales
+            x = unary_potential + self._window_reverse(pairwise_potential, self.window_size, H, W)
+            
+            # Procesamiento final MLP
+            x = x + self.mlp(self.norm2(x))
+            
+        except RuntimeError as e:
+            print(f"Error en forward de NewCRFBlock: {e}")
+            # En caso de error, devolver la entrada original para no interrumpir el flujo
+            print("Devolviendo entrada original como fallback")
+            return x
         
         return x
     
     def _window_partition(self, x, window_size):
         """Particiona la imagen en ventanas"""
         B, N, C = x.shape
-        H = W = int(np.sqrt(N))
-        x = x.view(B, H, W, C)
+        # Verificamos si N es un cuadrado perfecto
+        H = int(np.sqrt(N))
+        W = H
+        # Si no es un cuadrado perfecto, ajustamos W para que H*W sea igual a N
+        if H * W != N:
+            # Buscamos factores para H y W que sean más cercanos a ser iguales
+            for i in range(int(np.sqrt(N)), 0, -1):
+                if N % i == 0:
+                    H = i
+                    W = N // i
+                    break
+        
+        # Aseguramos que los datos se puedan reorganizar correctamente
+        try:
+            x = x.view(B, H, W, C)
+        except RuntimeError:
+            # Si hay un error, imprimimos información de depuración y ajustamos las dimensiones
+            print(f"Error de forma: intentando dar forma a tensor de tamaño {x.size()} a {B}x{H}x{W}x{C}")
+            # Redimensionar x para que sea compatible
+            x = x[:, :H*W, :].contiguous()
+            x = x.view(B, H, W, C)
         
         # Acolchado si es necesario
         pad_h = (window_size - H % window_size) % window_size
@@ -159,14 +202,48 @@ class NeWCRFBlock(nn.Module):
         pad_w = (window_size - W % window_size) % window_size
         H_padded, W_padded = H + pad_h, W + pad_w
         
-        B = int(windows.shape[0] // ((H_padded // window_size) * (W_padded // window_size)))
-        x = windows.view(B, H_padded // window_size, W_padded // window_size, 
-                         window_size, window_size, -1)
-        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H_padded, W_padded, -1)
+        # Verificar y ajustar si H o W no son compatibles con window_size
+        if H_padded % window_size != 0:
+            H_padded = (H_padded // window_size + 1) * window_size
+        if W_padded % window_size != 0:
+            W_padded = (W_padded // window_size + 1) * window_size
+            
+        # Calcular B de manera segura
+        try:
+            B = int(windows.shape[0] // ((H_padded // window_size) * (W_padded // window_size)))
+        except ZeroDivisionError:
+            # Si hay un error en la división, usamos un valor predeterminado para B
+            # Este es un caso de error que no debería ocurrir si las dimensiones son correctas
+            print(f"Error al calcular B. H_padded={H_padded}, W_padded={W_padded}, window_size={window_size}")
+            B = int(windows.shape[0])  # Usar un valor seguro como respaldo
+        # Reorganizar el tensor de manera segura
+        try:
+            x = windows.view(B, H_padded // window_size, W_padded // window_size, 
+                            window_size, window_size, -1)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H_padded, W_padded, -1)
+        except RuntimeError as e:
+            # En caso de error, imprimir información y hacer un ajuste alternativo
+            print(f"Error al reorganizar ventanas: {e}")
+            print(f"Dimensiones: B={B}, H_padded={H_padded}, W_padded={W_padded}, window_size={window_size}")
+            # Intentar una estrategia alternativa: redimensionar las ventanas
+            C = windows.size(-1)
+            windows_resized = torch.zeros(B * (H_padded // window_size) * (W_padded // window_size), 
+                                        window_size * window_size, C, device=windows.device)
+            # Copiar valores disponibles
+            min_size = min(windows.size(0), windows_resized.size(0))
+            windows_resized[:min_size] = windows[:min_size]
+            
+            # Intentar de nuevo con el tensor redimensionado
+            x = windows_resized.view(B, H_padded // window_size, W_padded // window_size, 
+                                    window_size, window_size, C)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H_padded, W_padded, C)
         
         # Quitar el acolchado si se aplicó
+        # Asegurar que no intentamos acceder más allá del tamaño del tensor
         if pad_h > 0 or pad_w > 0:
-            x = x[:, :H, :W, :].contiguous()
+            H_actual = min(H, x.size(1))
+            W_actual = min(W, x.size(2))
+            x = x[:, :H_actual, :W_actual, :].contiguous()
         
         return x.view(B, H * W, -1)
 

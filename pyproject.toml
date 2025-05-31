@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=11.2.1",
     "wandb>=0.19.11",
     "opencv-python>=4.11.0.86",
+    "tqdm>=4.67.1",
 ]
 
 [project.scripts]

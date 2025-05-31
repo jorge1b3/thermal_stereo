@@ -180,4 +180,5 @@ pyrightconfig.json
 raw
 *.png
 wandb
+*.pth
 
