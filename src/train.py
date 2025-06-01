@@ -121,6 +121,10 @@ def parse_args():
         parser.add_argument(
             "--max_disp", type=int, default=192, help="Disparidad máxima"
         )
+        parser.add_argument(
+            "--use_super_resolution", action="store_true", 
+            help="Usar módulos de super-resolución y refinamiento"
+        )
 
     # Parámetros de entrenamiento
     parser.add_argument(
