@@ -59,16 +59,19 @@ def parse_args():
                       help='Semilla para reproducibilidad')
     parser.add_argument('--use_super_resolution', type=bool, default=True,
                       help='Usar super-resolución y refinamiento para mejorar la calidad del mapa de profundidad')
+    parser.add_argument('--use_hybrid_refinement', type=bool, default=True,
+                      help='Usar módulo híbrido de refinamiento ViT-CNN para mejorar la calidad del mapa de profundidad')
     
     return parser.parse_args()
 
-def load_model(model_path, use_super_resolution=True):
+def load_model(model_path, use_super_resolution=True, use_hybrid_refinement=True):
     """
     Carga el modelo desde el checkpoint guardado.
     
     Args:
         model_path: ruta al checkpoint del modelo
         use_super_resolution: si True, habilita los módulos de super-resolución
+        use_hybrid_refinement: si True, habilita el módulo híbrido de refinamiento ViT-CNN
     """
     logger.info(f"Cargando modelo desde {model_path}")
     
@@ -97,7 +100,8 @@ def load_model(model_path, use_super_resolution=True):
         in_channels=3, 
         base_filters=initial_filters, 
         max_disp=192, 
-        use_super_resolution=config_sr
+        use_super_resolution=config_sr,
+        use_hybrid_refinement=use_hybrid_refinement
     )
     
     # Cargar pesos del modelo
@@ -243,7 +247,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Cargar el modelo
-    model = load_model(args.model_path, use_super_resolution=args.use_super_resolution)
+    model = load_model(
+        args.model_path, 
+        use_super_resolution=args.use_super_resolution,
+        use_hybrid_refinement=args.use_hybrid_refinement
+    )
     model.to(device)
     model.eval()
     

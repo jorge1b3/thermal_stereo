@@ -125,6 +125,10 @@ def parse_args():
             "--use_super_resolution", action="store_true", 
             help="Usar módulos de super-resolución y refinamiento"
         )
+        parser.add_argument(
+            "--use_hybrid_refinement", action="store_true", default=True,
+            help="Usar módulo híbrido de refinamiento ViT-CNN"
+        )
 
     # Parámetros de entrenamiento
     parser.add_argument(
@@ -879,11 +883,16 @@ def main():
             in_channels=3,  # 3 canales para imágenes térmicas (replicadas)
             base_filters=args.initial_filters,
             max_disp=args.max_disp,
+            use_super_resolution=args.use_super_resolution,
+            use_hybrid_refinement=args.use_hybrid_refinement if hasattr(args, 'use_hybrid_refinement') else True
         )
         model.to(device)
 
         logging.info(
-            f"Creado modelo unificado con {args.initial_filters} filtros iniciales y disparidad máxima {args.max_disp}"
+            f"Creado modelo unificado con {args.initial_filters} filtros iniciales, "
+            f"disparidad máxima {args.max_disp}, "
+            f"super-resolución: {args.use_super_resolution}, "
+            f"refinamiento híbrido: {getattr(args, 'use_hybrid_refinement', True)}"
         )
 
     else:

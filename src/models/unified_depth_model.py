@@ -533,11 +533,12 @@ class UnifiedDepthModel(nn.Module):
     Modelo unificado para estimación de profundidad monocular y estéreo basado en NeWCRF
     """
 
-    def __init__(self, in_channels=3, base_filters=64, max_disp=192, use_super_resolution=True):
+    def __init__(self, in_channels=3, base_filters=64, max_disp=192, use_super_resolution=True, use_hybrid_refinement=True):
         super(UnifiedDepthModel, self).__init__()
         self.max_disp = max_disp
         self.scales = 4
         self.use_super_resolution = use_super_resolution
+        self.use_hybrid_refinement = use_hybrid_refinement
 
         # Encoder para extracción de características (se aplica tanto a la imagen izquierda como a la derecha)
         self.encoder = SwinTransformerEncoder(
@@ -556,6 +557,13 @@ class UnifiedDepthModel(nn.Module):
             self.refinement_network = DepthRefinementNetwork(
                 in_channels=base_filters // 2  # base_filters // 2 corresponde a num_features[0]
             )
+            
+            # Módulo híbrido ViT-CNN para combinar imagen original con mapa de profundidad
+            if self.use_hybrid_refinement:
+                self.hybrid_refinement = HybridDepthRefinementModule(
+                    in_channels=in_channels,  # Número de canales de la imagen original
+                    depth_features=base_filters // 2  # Características del mapa de profundidad
+                )
 
         # Pyramid Pooling Module para contexto global
         num_features = [
@@ -710,7 +718,35 @@ class UnifiedDepthModel(nn.Module):
                     refined_depth = F.interpolate(refined_depth, size=original_size, mode='bilinear', align_corners=True)
                     enhanced_depth = F.interpolate(enhanced_depth, size=original_size, mode='bilinear', align_corners=True)
                 
-                # La resolución mejorada será ahora nuestra predicción principal
+                # Si el refinamiento híbrido está habilitado, aplicarlo como paso final
+                if self.use_hybrid_refinement:
+                    try:
+                        # Usar el módulo de refinamiento híbrido ViT-CNN para combinar imagen original con profundidad
+                        hybrid_refined_depth = self.hybrid_refinement(left, refined_depth)
+                        
+                        # Asegurar que la salida tenga las dimensiones correctas
+                        if hybrid_refined_depth.shape[2:] != original_size:
+                            hybrid_refined_depth = F.interpolate(
+                                hybrid_refined_depth, 
+                                size=original_size, 
+                                mode='bilinear', 
+                                align_corners=True
+                            )
+                        
+                        # Usar el mapa de profundidad refinado por el híbrido como salida final
+                        return {
+                            "mono_depth": hybrid_refined_depth,  # Predicción con refinamiento híbrido
+                            "stereo_depth": hybrid_refined_depth,
+                            "multi_scale_mono_depth": [hybrid_refined_depth, refined_depth, enhanced_depth] + disp_preds,
+                            "multi_scale_stereo_depth": [hybrid_refined_depth, refined_depth, enhanced_depth] + disp_preds,
+                            "prob_volumes": prob_volumes,
+                        }
+                        
+                    except Exception as e:
+                        print(f"Error en el módulo de refinamiento híbrido: {e}. Usando solo refinamiento estándar.")
+                        # Continuar con el refinamiento estándar si falla el híbrido
+                
+                # Si no hay refinamiento híbrido o falló, usar la versión refinada estándar
                 return {
                     "mono_depth": refined_depth,  # Predicción mejorada con super-resolución
                     "stereo_depth": refined_depth,
@@ -910,6 +946,170 @@ class DepthRefinementNetwork(nn.Module):
         return result
 
 
+class HybridDepthRefinementModule(nn.Module):
+    """
+    Módulo híbrido que combina características de la imagen térmica original 
+    con el mapa de profundidad generado para mejorar la coherencia espacial y los bordes.
+    
+    Este módulo implementa un enfoque híbrido ViT-CNN donde:
+    1. Extrae características de la imagen térmica original mediante CNNs
+    2. Procesa el mapa de profundidad mediante un encoder específico
+    3. Combina características mediante un mecanismo de atención
+    4. Refina el mapa final mediante un decoder tipo U-Net para recuperar bordes y detalles
+    """
+    def __init__(self, in_channels=3, depth_features=32, mid_channels=64):
+        super(HybridDepthRefinementModule, self).__init__()
+        
+        # Extractor de características de la imagen térmica
+        self.image_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(min(8, mid_channels), mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(min(8, mid_channels), mid_channels),
+            nn.GELU()
+        )
+        
+        # Extractor de características del mapa de profundidad
+        self.depth_encoder = nn.Sequential(
+            nn.Conv2d(1, depth_features, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(min(8, depth_features), depth_features),
+            nn.GELU(),
+            nn.Conv2d(depth_features, depth_features, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(min(8, depth_features), depth_features),
+            nn.GELU()
+        )
+        
+        # Mecanismo de atención para combinar características
+        self.attention = nn.Sequential(
+            nn.Conv2d(mid_channels + depth_features, mid_channels, kernel_size=1),
+            nn.GroupNorm(min(8, mid_channels), mid_channels),
+            nn.Sigmoid()
+        )
+        
+        # Transformador simplificado basado en convoluciones para procesar información global
+        self.transformer_block = nn.Sequential(
+            nn.Conv2d(mid_channels + depth_features, mid_channels*2, kernel_size=1),
+            nn.GroupNorm(min(8, mid_channels*2), mid_channels*2),
+            nn.GELU(),
+            # Un tipo de atención simple basada en convoluciones
+            nn.Conv2d(mid_channels*2, mid_channels*2, kernel_size=3, padding=1, groups=mid_channels*2),
+            nn.GroupNorm(min(8, mid_channels*2), mid_channels*2),
+            nn.GELU(),
+            nn.Conv2d(mid_channels*2, mid_channels*2, kernel_size=1),
+            nn.GroupNorm(min(8, mid_channels*2), mid_channels*2),
+            nn.GELU()
+        )
+        
+        # Extractor de bordes para preservar detalles finos
+        self.edge_extractor = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels//2, kernel_size=3, padding=1),
+            nn.GroupNorm(min(4, mid_channels//2), mid_channels//2),
+            nn.GELU(),
+            nn.Conv2d(mid_channels//2, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+        
+        # Decoder tipo U-Net para refinar y recuperar bordes - con conexiones skip
+        self.decoder_level1 = nn.Sequential(
+            # Nivel 1
+            nn.Conv2d(mid_channels*2 + mid_channels + 1, mid_channels*2, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, mid_channels*2), mid_channels*2),
+            nn.GELU()
+        )
+        
+        self.decoder_level2 = nn.Sequential(
+            # Nivel 2 - Refinamiento de bordes
+            nn.Conv2d(mid_channels*2 + 1, mid_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, mid_channels), mid_channels),
+            nn.GELU()
+        )
+        
+        # Capa de fusión final
+        self.fusion_layer = nn.Sequential(
+            nn.Conv2d(mid_channels + 1, mid_channels//2, kernel_size=3, padding=1),
+            nn.GroupNorm(min(4, mid_channels//2), mid_channels//2),
+            nn.GELU(),
+            nn.Conv2d(mid_channels//2, 1, kernel_size=1)
+        )
+        
+        # Factor de suavizado para la conexión residual
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        
+        # Inicialización cuidadosa para estabilidad
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Inicialización cuidadosa de pesos para estabilidad durante el entrenamiento"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+                    
+        # Para las capas de salida, inicializar con valores más pequeños
+        for m in self.fusion_layer.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, original_image, depth_map):
+        """
+        Refina el mapa de profundidad usando la imagen original como guía
+        
+        Args:
+            original_image: Imagen térmica original [B, C, H, W]
+            depth_map: Mapa de profundidad generado [B, 1, H, W]
+        """
+        # Asegurar dimensiones correctas
+        B, C, H, W = original_image.shape
+        _, _, Hd, Wd = depth_map.shape
+        
+        if H != Hd or W != Wd:
+            depth_map = F.interpolate(
+                depth_map, 
+                size=(H, W),
+                mode='bilinear',
+                align_corners=True
+            )
+        
+        # Extraer características de la imagen y del mapa de profundidad
+        img_features = self.image_encoder(original_image)
+        depth_features = self.depth_encoder(depth_map)
+        
+        # Extraer información de bordes para guiar el proceso
+        edge_map = self.edge_extractor(original_image)
+        
+        # Calcular mapa de atención entre imagen y profundidad
+        combined_features = torch.cat([img_features, depth_features], dim=1)
+        attention_map = self.attention(combined_features)
+        
+        # Aplicar atención a las características de la imagen
+        attended_features = img_features * attention_map
+        
+        # Procesar con el bloque transformador
+        transformer_features = self.transformer_block(combined_features)
+        
+        # Decoder tipo U-Net con conexiones skip para recuperar detalles
+        # Nivel 1
+        decoder_input_1 = torch.cat([transformer_features, attended_features, edge_map], dim=1)
+        decoder_features_1 = self.decoder_level1(decoder_input_1)
+        
+        # Nivel 2 con conexión skip desde el mapa de bordes
+        decoder_input_2 = torch.cat([decoder_features_1, edge_map], dim=1)
+        decoder_features_2 = self.decoder_level2(decoder_input_2)
+        
+        # Fusión final con el mapa de profundidad original
+        fusion_input = torch.cat([decoder_features_2, depth_map], dim=1)
+        refined_depth = self.fusion_layer(fusion_input)
+        
+        # Conexión residual con el mapa original para preservar estructura
+        final_depth = depth_map + self.alpha * refined_depth
+        
+        return final_depth
+
+
 def prepare_inputs(batch, device):
     """
     Prepara los datos de entrada para el modelo.
@@ -1012,7 +1212,7 @@ def smooth_l1_loss(pred, target, mask=None):
         return loss.mean()
 
 
-def get_unified_depth_model(initial_filters=64, max_disp=192, use_super_resolution=True):
+def get_unified_depth_model(initial_filters=64, max_disp=192, use_super_resolution=True, use_hybrid_refinement=True):
     """
     Crea un nuevo modelo unificado de estimación de profundidad.
 
@@ -1020,6 +1220,7 @@ def get_unified_depth_model(initial_filters=64, max_disp=192, use_super_resoluti
         initial_filters: número de filtros iniciales para el modelo
         max_disp: disparidad máxima para el volumen de costos
         use_super_resolution: si True, habilita los módulos de super-resolución y refinamiento
+        use_hybrid_refinement: si True, habilita el módulo híbrido ViT-CNN para refinamiento de profundidad
 
     Returns:
         modelo: Una instancia del modelo UnifiedDepthModel
@@ -1028,5 +1229,6 @@ def get_unified_depth_model(initial_filters=64, max_disp=192, use_super_resoluti
         in_channels=3, 
         base_filters=initial_filters, 
         max_disp=max_disp,
-        use_super_resolution=use_super_resolution
+        use_super_resolution=use_super_resolution,
+        use_hybrid_refinement=use_hybrid_refinement
     )

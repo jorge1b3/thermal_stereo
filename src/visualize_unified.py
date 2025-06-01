@@ -48,6 +48,14 @@ def parse_args():
     parser.add_argument(
         "--num_samples", type=int, default=10, help="Número de muestras a visualizar"
     )
+    parser.add_argument(
+        "--use_super_resolution", action="store_true", default=True,
+        help="Usar módulos de super-resolución y refinamiento"
+    )
+    parser.add_argument(
+        "--use_hybrid_refinement", action="store_true", default=True,
+        help="Usar módulo híbrido de refinamiento ViT-CNN"
+    )
 
     return parser.parse_args()
 
@@ -204,7 +212,11 @@ def main():
 
     # Crear modelo
     model = UnifiedDepthModel(
-        in_channels=3, base_filters=args.initial_filters, max_disp=args.max_disp
+        in_channels=3, 
+        base_filters=args.initial_filters, 
+        max_disp=args.max_disp,
+        use_super_resolution=args.use_super_resolution,
+        use_hybrid_refinement=args.use_hybrid_refinement if hasattr(args, 'use_hybrid_refinement') else True
     )
 
     # Cargar pesos del modelo
