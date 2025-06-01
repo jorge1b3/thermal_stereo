@@ -525,7 +525,8 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
     """
     # Configuración de pesos para las diferentes escalas
     # El modelo puede devolver más de 4 escalas debido al mapa mejorado, así que hacemos la lista más larga
-    scale_weights = [0.5, 0.7, 0.85, 1.0, 1.0, 1.0]  # Extendemos para soportar hasta 6 escalas
+    scale_weights = [1.0, 0.85, 0.7, 0.5, 0.3, 0.2]  # Extendemos para soportar hasta 6 escalas
+                                                     # y damos más peso a las escalas de mayor resolución
 
     # Crear directorio para guardar modelos si no existe
     os.makedirs(args.output_dir, exist_ok=True)
@@ -555,6 +556,11 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         logging.info(f"Reanudando desde época {start_epoch}")
+
+    # Si el modelo no está en modo de super-resolución, acortar la lista de pesos
+    if not hasattr(model, 'use_super_resolution') or not model.use_super_resolution:
+        scale_weights = scale_weights[2:]  # Usar solo los pesos para las 4 escalas básicas
+        logging.info("Modelo en modo básico (sin super-resolución), ajustando pesos de escalas")
 
     # Bucle de entrenamiento por épocas
     for epoch in range(start_epoch, args.num_epochs):
@@ -603,10 +609,12 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
                     stereo_depth_resized = stereo_depth
                 
                 # Aplicar peso a la escala correspondiente
+                # Usar el peso correspondiente al índice, o el último peso si estamos fuera de rango
+                weight = scale_weights[i] if i < len(scale_weights) else scale_weights[-1]
                 scale_loss = (
                     smooth_l1_loss(mono_depth_resized, depth)
                     + smooth_l1_loss(stereo_depth_resized, depth)
-                ) * scale_weights[i]
+                ) * weight
 
                 loss += scale_loss
 
@@ -622,13 +630,11 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
 
             # Registrar en wandb cada 50 batches
             if batch_idx % 50 == 0:
-                wandb.log(
-                    {
-                        "batch": batch_idx + epoch * len(train_loader),
-                        "train_batch_loss": loss.item(),
-                        "learning_rate": optimizer.param_groups[0]["lr"],
-                    }
-                )
+                wandb.log({
+                    "batch": batch_idx + epoch * len(train_loader),
+                    "train_batch_loss": loss.item(),
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                })
 
         # Calcular pérdida media de entrenamiento
         train_loss /= len(train_loader)
@@ -644,7 +650,14 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
                 output = model(left, right)
 
                 # Calcular pérdida de validación (solo para la predicción final)
-                val_loss_batch = smooth_l1_loss(output["stereo_depth"], depth)
+                # Usamos la predicción principal (mono o stereo)
+                pred_depth = output["stereo_depth"]
+                
+                # Asegurarnos de que las dimensiones coincidan
+                if pred_depth.shape[2:] != depth.shape[2:]:
+                    pred_depth = F.interpolate(pred_depth, size=depth.shape[2:], mode='bilinear', align_corners=True)
+                    
+                val_loss_batch = smooth_l1_loss(pred_depth, depth)
                 val_loss += val_loss_batch.item()
 
         # Calcular pérdida media de validación
@@ -654,14 +667,12 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
         scheduler.step()
 
         # Registrar métricas en wandb
-        wandb.log(
-            {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "learning_rate": optimizer.param_groups[0]["lr"],
-            }
-        )
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        })
 
         logging.info(
             f"Época {epoch+1}/{args.num_epochs}, "
@@ -687,7 +698,7 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "train_loss": train_loss,  # para train_unified usamos train_loss
+                    "train_loss": train_loss,
                     "val_loss": val_loss,
                 },
                 checkpoint_path,
@@ -706,6 +717,12 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
     
     # Guardar modelo final (que es el mejor según val_loss)
     final_model_path = os.path.join(args.output_dir, f"{experiment_name}_final_{timestamp}.pth")
+    
+    # Guardar información adicional sobre super-resolución
+    config_dict = vars(args)
+    if hasattr(model, 'use_super_resolution'):
+        config_dict['use_super_resolution'] = model.use_super_resolution
+    
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -714,7 +731,7 @@ def train_unified(model, train_loader, val_loader, optimizer, scheduler, device,
             "val_loss": val_loss,
             "best_epoch": early_stopping.best_epoch,
             "timestamp": timestamp,
-            "config": vars(args),
+            "config": config_dict,
         },
         final_model_path,
     )

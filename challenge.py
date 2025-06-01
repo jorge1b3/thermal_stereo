@@ -57,12 +57,18 @@ def parse_args():
                       help='Guardar visualizaciones de las profundidades predichas')
     parser.add_argument('--seed', type=int, default=42,
                       help='Semilla para reproducibilidad')
+    parser.add_argument('--use_super_resolution', type=bool, default=True,
+                      help='Usar super-resolución y refinamiento para mejorar la calidad del mapa de profundidad')
     
     return parser.parse_args()
 
-def load_model(model_path):
+def load_model(model_path, use_super_resolution=True):
     """
     Carga el modelo desde el checkpoint guardado.
+    
+    Args:
+        model_path: ruta al checkpoint del modelo
+        use_super_resolution: si True, habilita los módulos de super-resolución
     """
     logger.info(f"Cargando modelo desde {model_path}")
     
@@ -71,12 +77,28 @@ def load_model(model_path):
     
     # Extraer configuración del modelo si está disponible
     initial_filters = 32  # valor por defecto
+    config_sr = use_super_resolution  # valor por defecto desde argumento
+    
     if 'config' in checkpoint:
-        initial_filters = checkpoint['config'].get('initial_filters', 16)
+        config_dict = checkpoint['config']
+        initial_filters = config_dict.get('initial_filters', 16)
+        
+        # Si el checkpoint tiene la configuración de super-resolución, usarla
+        if 'use_super_resolution' in config_dict:
+            config_sr = config_dict['use_super_resolution']
+            logger.info(f"Usando configuración de super-resolución del checkpoint: {config_sr}")
+        else:
+            logger.info(f"Usando configuración de super-resolución del argumento: {config_sr}")
+            
         logger.info(f"Usando configuración del checkpoint: initial_filters={initial_filters}")
     
     # Crear instancia del modelo
-    model = UnifiedDepthModel(in_channels=3, base_filters=initial_filters, max_disp=192)
+    model = UnifiedDepthModel(
+        in_channels=3, 
+        base_filters=initial_filters, 
+        max_disp=192, 
+        use_super_resolution=config_sr
+    )
     
     # Cargar pesos del modelo
     try:
@@ -221,9 +243,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Cargar el modelo
-    model = load_model(args.model_path)
+    model = load_model(args.model_path, use_super_resolution=args.use_super_resolution)
     model.to(device)
     model.eval()
+    
+    # Informar sobre la configuración de super-resolución
+    if hasattr(model, 'use_super_resolution'):
+        logger.info(f"Modelo usando super-resolución: {'Sí' if model.use_super_resolution else 'No'}")
     
     # Cargar dataset de prueba
     try:
@@ -286,9 +312,9 @@ def main():
                     pred_depth = outputs[first_key]
                     depth_type = first_key
                     
-                logger.info("Usando mapa de profundidad de tipo: {}".format(depth_type))
+                logger.info(f"Usando mapa de profundidad de tipo: {depth_type}")
             except Exception as e:
-                logger.error("Error en forward pass: {}".format(e))
+                logger.error(f"Error en forward pass: {e}")
                 continue
             
             # Calcular métricas por imagen
@@ -323,6 +349,7 @@ def main():
     results = {
         "model_path": args.model_path,
         "test_samples": sample_count,
+        "use_super_resolution": model.use_super_resolution if hasattr(model, 'use_super_resolution') else False,
         "global_metrics": global_metrics,
         "predictions": predictions
     }
