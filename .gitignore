@@ -182,4 +182,5 @@ raw
 wandb
 *.pth
 config/
-
+*.patch
+challenge_results/
